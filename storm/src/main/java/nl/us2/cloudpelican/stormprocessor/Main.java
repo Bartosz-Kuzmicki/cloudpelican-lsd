@@ -9,7 +9,6 @@ import backtype.storm.LocalCluster;
 import backtype.storm.StormSubmitter;
 import backtype.storm.spout.SchemeAsMultiScheme;
 import backtype.storm.topology.TopologyBuilder;
-import backtype.storm.utils.Utils;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -22,7 +21,10 @@ import java.util.UUID;
 public class Main {
     public static String KAFKA_SPOUT = "kafka_spout";
     public static String MATCH_BOLT = "match_bolt";
-    public static String SUPERVISOR_WRITER = "supervisor_writer";
+    public static String SUPERVISOR_RESULT_WRITER = "supervisor_result_writer";
+    public static String SUPERVISOR_STATS_WRITER = "supervisor_stats_writer";
+    public static String SUPERVISOR_ERROR_STATS_WRITER = "supervisor_error_stats_writer";
+    public static String ERROR_CLASSIFIER_BOLT = "error_classifier";
     private static boolean isRunning = true;
     private static final Logger LOG = LoggerFactory.getLogger(Main.class);
 
@@ -53,6 +55,9 @@ public class Main {
                 }
             }
         }
+        if (!settings.containsKey("kafka_consumer_id")) {
+            settings.put("kafka_consumer_id", "default_cloudpelican_lsd_consumer");
+        }
         LOG.info(settings.toString());
 
         // Topology
@@ -65,17 +70,24 @@ public class Main {
         // Read from kafka
 
         BrokerHosts hosts = new ZkHosts(settings.get("zookeeper_nodes"));
-        SpoutConfig spoutConfig = new SpoutConfig(hosts, settings.get("kafka_topic"), "/" + settings.get("kafka_topic"), UUID.randomUUID().toString());
+        SpoutConfig spoutConfig = new SpoutConfig(hosts, settings.get("kafka_topic"), "/" + settings.get("kafka_topic"), settings.get("kafka_consumer_id"));
         spoutConfig.startOffsetTime = kafka.api.OffsetRequest.EarliestTime();
         spoutConfig.scheme = new SchemeAsMultiScheme(new StringScheme());
         KafkaSpout kafkaSpout = new KafkaSpout(spoutConfig);
         builder.setSpout(KAFKA_SPOUT, kafkaSpout, 3);
 
         // Match bolt
-        builder.setBolt(MATCH_BOLT, new MatchBolt(settings), globalConcurrency * 4).localOrShuffleGrouping(KAFKA_SPOUT);
+        builder.setBolt(MATCH_BOLT, new MatchBolt(settings), globalConcurrency * 8).localOrShuffleGrouping(KAFKA_SPOUT);
 
-        // Supervisor writer bolt
-        builder.setBolt(SUPERVISOR_WRITER, new ResultSupervisorWriterBolt(settings), globalConcurrency * 4).fieldsGrouping(MATCH_BOLT, new Fields("filter_id"));
+        // Error classifier bolt
+        builder.setBolt(ERROR_CLASSIFIER_BOLT, new ErrorClassifierBolt(settings), globalConcurrency * 8).fieldsGrouping(MATCH_BOLT, new Fields("filter_id"));
+
+        // Supervisor result writer bolt
+        builder.setBolt(SUPERVISOR_RESULT_WRITER, new SupervisorResultWriterBolt(settings), globalConcurrency * 4).fieldsGrouping(MATCH_BOLT, new Fields("filter_id"));
+
+        // Supervisor stats writer bolt
+        builder.setBolt(SUPERVISOR_STATS_WRITER, new SupervisorStatsWriterBolt(settings), globalConcurrency * 2).fieldsGrouping(MATCH_BOLT, "match_stats", new Fields("filter_id"));
+        builder.setBolt(SUPERVISOR_ERROR_STATS_WRITER, new SupervisorStatsWriterBolt(settings), globalConcurrency * 2).fieldsGrouping(ERROR_CLASSIFIER_BOLT, "error_stats", new Fields("filter_id"));
 
         // Debug on for testing
         Config conf = new Config();

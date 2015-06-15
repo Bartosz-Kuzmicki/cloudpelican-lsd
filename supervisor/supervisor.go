@@ -8,12 +8,15 @@ package main
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/RobinUS2/golang-jresp"
 	"github.com/julienschmidt/httprouter"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -53,7 +56,9 @@ func main() {
 	// Filters
 	router.POST("/filter", PostFilter)                // Create new filter
 	router.GET("/filter/:id/result", GetFilterResult) // Get results of a single filter
+	router.GET("/filter/:id/stats", GetFilterStats)   // Get stats of a single filter
 	router.PUT("/filter/:id/result", PutFilterResult) // Store new results into a filter
+	router.PUT("/stats/filters", PutStatsFilters)     // Store new statistics around filters
 	router.GET("/filter", GetFilter)                  // Get all filters
 	router.DELETE("/filter/:id", DeleteFilter)        // Delete a filter
 
@@ -149,6 +154,37 @@ func GetFilterResult(w http.ResponseWriter, r *http.Request, ps httprouter.Param
 	}
 }
 
+func GetFilterStats(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	if !basicAuth(w, r) {
+		return
+	}
+	jresp := jresp.NewJsonResp()
+	id := strings.TrimSpace(ps.ByName("id"))
+	if len(id) < 1 {
+		jresp.Error("Please provide an ID")
+		fmt.Fprint(w, jresp.ToString(false))
+		return
+	}
+	filter := filterManager.GetFilter(id)
+	if filter == nil {
+		jresp.Error(fmt.Sprintf("Filter %s not found", id))
+		fmt.Fprint(w, jresp.ToString(false))
+		return
+	}
+	stats := filter.GetStats()
+	m := make(map[string]map[string]int64) // metricid => timebucket => value
+	for metricId, metric := range stats.Metrics {
+		ms := fmt.Sprintf("%d", metricId)
+		m[ms] = make(map[string]int64)
+		for ts, val := range metric.Data {
+			m[ms][fmt.Sprintf("%d", ts)] = val
+		}
+	}
+	jresp.Set("stats", m)
+	jresp.OK()
+	fmt.Fprint(w, jresp.ToString(false))
+}
+
 func PutFilterResult(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	if !basicAuth(w, r) {
 		return
@@ -196,6 +232,96 @@ func GetFilter(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	jresp := jresp.NewJsonResp()
 	filters := filterManager.GetFilters()
 	jresp.Set("filters", filters)
+	jresp.OK()
+	fmt.Fprint(w, jresp.ToString(false))
+}
+
+func PutStatsFilters(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	if !basicAuth(w, r) {
+		return
+	}
+	jresp := jresp.NewJsonResp()
+
+	// Read body
+	bodyBytes, bodyErr := ioutil.ReadAll(r.Body)
+	if bodyErr != nil {
+		jresp.Error("Invalid request body")
+		fmt.Fprint(w, jresp.ToString(false))
+		return
+	}
+
+	// JSON decode
+	var data map[string]int64
+	jsonErr := json.Unmarshal(bodyBytes, &data)
+	if jsonErr != nil {
+		jresp.Error(fmt.Sprintf("Invalid request JSON: %s", jsonErr))
+		fmt.Fprint(w, jresp.ToString(false))
+		return
+	}
+
+	// Store results
+	var filterId string
+	var metric int
+	var timeBucket int64
+	var updates int // Amount of acknowledged updates
+	for k, count := range data {
+		// Reset vars
+		filterId = ""
+		metric = 0
+		timeBucket = 0
+
+		// Split
+		pairs := strings.Split(k, "_")
+		for _, pair := range pairs {
+			kv := strings.SplitN(pair, "=", 2)
+			if len(kv) != 2 {
+				log.Println("Invalid KV pair in PutStatsFilters")
+				continue
+			}
+			if kv[0] == "f" {
+				// Filter ID
+				filterId = kv[1]
+			} else if kv[0] == "m" {
+				// Metric
+				i, e := strconv.ParseInt(kv[1], 10, 0)
+				if e != nil {
+					log.Println("Invalid integer %s in PutStatsFilters", kv[1])
+					continue
+				}
+				metric = int(i)
+			} else if kv[0] == "b" {
+				// Time bucket
+				i, e := strconv.ParseInt(kv[1], 10, 64)
+				if e != nil {
+					log.Println("Invalid integer %s in PutStatsFilters", kv[1])
+					continue
+				}
+				timeBucket = int64(i)
+			}
+		}
+
+		// Filter?
+		if len(filterId) == 0 {
+			log.Println("Empty filter in PutStatsFilters")
+			continue
+		}
+
+		// Load filter
+		filter := filterManager.GetFilter(filterId)
+		if filter == nil {
+			log.Println("Filter %s not found in PutStatsFilters", filterId)
+			continue
+		}
+
+		// Set results
+		res := filter.AddStats(metric, timeBucket, count)
+		if res {
+			updates++
+		}
+	}
+
+	// OK
+	jresp.Set("updates", updates)
 	jresp.OK()
 	fmt.Fprint(w, jresp.ToString(false))
 }

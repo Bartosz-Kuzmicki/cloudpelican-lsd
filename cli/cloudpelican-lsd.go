@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +25,7 @@ var verbose bool
 
 const CONSOLE_PREFIX string = "cloudpelican"
 const CONSOLE_SEP string = "> "
+const TMP_FILTER_PREFIX string = "__tmp__"
 
 var CONSOLE_KEYWORDS map[string]bool = make(map[string]bool)
 var CONSOLE_KEYWORDS_OPTS map[string]int = make(map[string]int)
@@ -36,8 +38,10 @@ var interrupted bool
 var startupCommands string
 var silent bool
 var allowAutoCreateFilter bool
+var stats *Statistics
 var term *terminal.Terminal
 var oldState *terminal.State
+var cmdFinishChan chan bool
 
 func init() {
 	flag.StringVar(&customConfPath, "c", "", "Path to configuration file (default in your home folder)")
@@ -56,9 +60,18 @@ func main() {
 	// Load config
 	loadConf()
 
+	// Stats
+	stats = newStatistics()
+
+	// Wait channel
+	cmdFinishChan = make(chan bool, 1)
+
 	// Startup commands
 	if len(startupCommands) > 0 {
-		handleConsole(startupCommands)
+		wait := handleConsole(startupCommands)
+		if wait {
+			<-cmdFinishChan
+		}
 		restoreTerminalAndExit(term, oldState)
 	}
 
@@ -82,6 +95,7 @@ func startConsole() {
 	CONSOLE_KEYWORDS_OPTS["connect"] = 2 // connect + uri
 	CONSOLE_KEYWORDS_OPTS["tail"] = 2    // tail + filter name
 	CONSOLE_KEYWORDS_OPTS["auth"] = 3    // auth + usr + pwd
+	CONSOLE_KEYWORDS_OPTS["stats"] = 2   // stats + filter name
 
 	// Console reader
 	term, _ = terminal.NewWithStdInOut()
@@ -90,14 +104,16 @@ func startConsole() {
 		panic(err)
 	}
 	defer restoreTerminalAndExit(term, oldState)
-	term.SetPrompt(getConsoleWait())
+	term.SetPrompt("")
+	fmt.Printf("%s", getConsoleWait())
 	term.AutoCompleteCallback = processAutocomplete
 
 	// Main loop
+	var lineBuffer bytes.Buffer
 	for {
-		input, err := term.ReadLine()
+		line, err := term.ReadLine()
 		if err == io.EOF {
-			term.Write([]byte(input))
+			term.Write([]byte(line))
 			fmt.Println()
 			restoreTerminalAndExit(term, oldState)
 		}
@@ -107,6 +123,8 @@ func startConsole() {
 			if err != nil {
 				fmt.Println("Error: ", err)
 			} else {
+				lineBuffer.WriteString(fmt.Sprintf("%s ", line))
+				input := lineBuffer.String()
 				input = strings.TrimSpace(input)
 				lowerStr := strings.ToLower(input)
 				splitLower := strings.Split(lowerStr, " ")
@@ -114,7 +132,11 @@ func startConsole() {
 				// Semi colon?
 				if strings.Contains(input, ";") || CONSOLE_KEYWORDS[lowerStr] || CONSOLE_KEYWORDS_OPTS[splitLower[0]] == len(splitLower) {
 					// Flush buffer
+					lineBuffer.Reset()
 					handleConsole(input)
+					fmt.Printf("%s", getConsoleWait())
+				} else {
+					printConsoleInputPad()
 				}
 			}
 		}
@@ -131,7 +153,7 @@ func handleInterrupt() {
 	}
 }
 
-func _handleConsole(input string) {
+func _handleConsole(input string) bool {
 	input = strings.TrimSpace(input)
 	consoleAddHistory(input)
 	inputLower := strings.ToLower(input)
@@ -140,9 +162,7 @@ func _handleConsole(input string) {
 	} else if inputLower == "quit" || inputLower == "exit" {
 		restoreTerminalAndExit(term, oldState)
 	} else if inputLower == "clear" {
-		c := exec.Command("clear")
-		c.Stdout = os.Stdout
-		c.Run()
+		clearConsole()
 	} else if inputLower == "save" {
 		save()
 	} else if inputLower == "ping" {
@@ -163,40 +183,50 @@ func _handleConsole(input string) {
 		split := strings.SplitN(input, "drop filter ", 2)
 		if len(split) != 2 {
 			printConsoleError(input)
-			return
+			return false
 		}
 		dropFilter(split[1])
 	} else if strings.Index(inputLower, "history ") == 0 {
 		split := strings.SplitN(input, "history ", 2)
 		if len(split) != 2 {
 			printConsoleError(input)
-			return
+			return false
 		}
 		dispatchHistory(split[1])
 	} else if strings.Index(inputLower, "connect ") == 0 {
 		split := strings.SplitN(input, "connect ", 2)
 		if len(split) != 2 {
 			printConsoleError(input)
-			return
+			return false
 		}
 		connect(split[1])
 	} else if strings.Index(inputLower, "tail ") == 0 {
 		split := strings.SplitN(input, "tail ", 2)
 		if len(split) != 2 {
 			printConsoleError(input)
-			return
+			return false
 		}
 		executeSelect(fmt.Sprintf("select * from %s", split[1]))
+		return true
+	} else if strings.Index(inputLower, "stats ") == 0 {
+		split := strings.SplitN(input, "stats ", 2)
+		if len(split) != 2 {
+			printConsoleError(input)
+			return false
+		}
+		getStats(split[1])
+		return false
 	} else if strings.Index(inputLower, "auth ") == 0 {
 		split := strings.Split(input, " ")
 		if len(split) != 3 {
 			printConsoleError(input)
-			return
+			return false
 		}
 		auth(split[1], split[2])
 	} else {
 		printConsoleError(input)
 	}
+	return false
 }
 
 // Select execution, example input: "create filter <filter_name> as '<regex_here>' [with options {"key": "value"}]" [] indicates optional
@@ -257,15 +287,20 @@ func dropFilter(name string) {
 	}
 }
 
-func handleConsole(input string) {
+func handleConsole(input string) bool {
 	input = strings.TrimRight(input, " ;\n\t")
 	if len(input) < 1 {
-		return
+		return false
 	}
 	cmds := strings.Split(input, ";")
+	var wait bool
 	for _, cmd := range cmds {
-		_handleConsole(cmd)
+		subWait := _handleConsole(cmd)
+		if subWait {
+			wait = true
+		}
 	}
+	return wait
 }
 
 func showFilters() {
@@ -341,10 +376,15 @@ func executeSelect(input string) {
 			//streamName := split[1]
 
 			// Create filter
-			tmpFilterName = fmt.Sprintf("tmp_%d", time.Now().Unix())
+			tmpFilterName = fmt.Sprintf("%d", TMP_FILTER_PREFIX, time.Now().Unix())
 			supervisorCon.CreateFilter(tmpFilterName, where)
 			filter, _ = supervisorCon.FilterByName(tmpFilterName)
 		}
+	}
+
+	// Clear channel
+	if len(cmdFinishChan) > 0 {
+		<-cmdFinishChan
 	}
 
 	// Stream data
@@ -391,6 +431,7 @@ func executeSelect(input string) {
 			}
 		}
 		fmt.Printf(getConsoleWait())
+		cmdFinishChan <- true
 	}()
 }
 
@@ -472,9 +513,50 @@ func auth(usr string, pwd string) {
 	}
 }
 
+func getStats(filterName string) {
+	filter, filterE := supervisorCon.FilterByName(filterName)
+	if filterE != nil {
+		printConsoleError("Filter not found")
+		return
+	}
+
+	// Load
+	data, statsE := filter.GetStats(60) // @todo dynamic, default to hour?
+	if statsE != nil {
+		printConsoleError(fmt.Sprintf("%s", statsE))
+		return
+	}
+	if verbose {
+		log.Printf("Stats %v", data)
+	}
+
+	// Get console width
+	stats.loadTerminalDimensions()
+
+	// Clear console
+	clearConsole()
+
+	// Render chart
+	chart, chartE := stats.RenderChart(filter, data)
+	if chartE != nil {
+		printConsoleError(fmt.Sprintf("%s", chartE))
+		return
+	}
+
+	// Print chart
+	fmt.Printf("\n")
+	fmt.Printf("%s", chart)
+}
+
 func connect(uri string) {
 	session["supervisor_uri"] = uri
 	_connect(true)
+}
+
+func clearConsole() {
+	c := exec.Command("clear")
+	c.Stdout = os.Stdout
+	c.Run()
 }
 
 func _connect(interactive bool) {
@@ -496,6 +578,7 @@ func printConsoleHelp() {
 	fmt.Printf("show filters\t\t\tDisplay list of filters configured\n")
 	fmt.Printf("select\t\t\t\tExecute SQL-like queries, example: select * from <filter_name>;\n")
 	fmt.Printf("tail <filter>\t\t\tTail stream of messages for a specific filter name\n")
+	fmt.Printf("stats <filter>\t\t\tShow matching rate for a specific filter name\n")
 	fmt.Printf("create filter\t\t\tCreate a new filter, example: create filter <filter_name> as '<regex>';\n")
 	fmt.Printf("drop filter\t\t\tRemove a filter, example: drop filter <filter_name>;\n")
 	fmt.Printf("clear\t\t\t\tClears console\n")
@@ -514,6 +597,10 @@ func getConsoleWait() string {
 	return fmt.Sprintf("%s%s", CONSOLE_PREFIX, CONSOLE_SEP)
 }
 
+func printConsoleInputPad() {
+	fmt.Printf("%s%s", strings.Repeat(" ", len(CONSOLE_PREFIX)), CONSOLE_SEP)
+}
+
 func restoreTerminalAndExit(term *terminal.Terminal, oldState *terminal.State) {
 	if oldState != nil {
 		terminal.Restore(0, oldState)
@@ -525,6 +612,59 @@ func restoreTerminalAndExit(term *terminal.Terminal, oldState *terminal.State) {
 }
 
 func processAutocomplete(line []byte, pos, key int) (newLine []byte, newPos int) {
-	// TODO
+	// Handle cursor interactions (ctrl+a = begin, ctrl+e = end)
+	if key == 1 {
+		// Begin of line
+		return line, 0
+	} else if key == 5 {
+		// Begin of line
+		return line, len(line)
+	}
+
+	// Only for tabs
+	if key != 9 {
+		return nil, pos
+	}
+
+	// String
+	lineStr := strings.ToLower(strings.TrimSpace(string(line)))
+
+	// Options placeholder
+	opts := make([]string, 0)
+
+	// Look for console keywords
+	for k, _ := range CONSOLE_KEYWORDS {
+		if strings.Index(k, lineStr) == 0 {
+			opts = append(opts, k)
+		}
+	}
+
+	// Look for console methods with options
+	for k, _ := range CONSOLE_KEYWORDS_OPTS {
+		if strings.Index(k, lineStr) == 0 {
+			opts = append(opts, k)
+		}
+	}
+
+	// Autocomplete filter names
+	if strings.Index(lineStr, "stats") == 0 || strings.Index(lineStr, "tail") == 0 {
+		split := strings.SplitN(lineStr, " ", 2)
+		if len(split) == 2 {
+			filters, _ := supervisorCon.Filters()
+			if filters != nil {
+				for _, filter := range filters {
+					if strings.Index(filter.Name, split[1]) == 0 {
+						opts = append(opts, fmt.Sprintf("%s %s", split[0], filter.Name))
+					}
+				}
+			}
+		}
+	}
+
+	// Only suggest if we have one option left
+	if len(opts) == 1 {
+		var opt = opts[0]
+		return []byte(opt), pos + len(opt) - len(lineStr)
+	}
 	return nil, pos
 }
